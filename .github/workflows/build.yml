@@ -1,0 +1,464 @@
+
+name: Build FocusLock APK
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+
+      - name: Generate Project Files
+        run: |
+          mkdir -p app/src/main/java/com/focuslock/app
+
+          cat << 'EOF' > settings.gradle.kts
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "FocusLock"
+          include(":app")
+          EOF
+
+          cat << 'EOF' > app/build.gradle.kts
+          plugins {
+              id("com.android.application") version "8.4.0"
+              id("org.jetbrains.kotlin.android") version "1.9.24"
+          }
+
+          android {
+              namespace = "com.focuslock.app"
+              compileSdk = 34
+
+              defaultConfig {
+                  applicationId = "com.focuslock.app"
+                  minSdk = 29
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions {
+                  jvmTarget = "17"
+              }
+          }
+          EOF
+
+          cat << 'EOF' > app/src/main/AndroidManifest.xml
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android"
+              package="com.focuslock.app">
+
+              <uses-permission android:name="android.permission.INTERNET" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SYSTEM_EXEMPTED" />
+              <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+              <uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM" />
+              <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+              <application
+                  android:label="FocusLock Hardcore"
+                  android:allowBackup="false"
+                  android:fullBackupContent="false">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+                  <service
+                      android:name=".HardcoreBlockerVpnService"
+                      android:directBootAware="true"
+                      android:enabled="true"
+                      android:exported="false"
+                      android:foregroundServiceType="systemExempted"
+                      android:permission="android.permission.BIND_VPN_SERVICE">
+                      <intent-filter>
+                          <action android:name="android.net.VpnService" />
+                      </intent-filter>
+                  </service>
+
+                  <receiver
+                      android:name=".BootAndWatchdogReceiver"
+                      android:directBootAware="true"
+                      android:enabled="true"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.LOCKED_BOOT_COMPLETED" />
+                          <action android:name="android.intent.action.BOOT_COMPLETED" />
+                          <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+                          <action android:name="com.focuslock.app.ACTION_WATCHDOG_PULSE" />
+                      </intent-filter>
+                  </receiver>
+              </application>
+          </manifest>
+          EOF
+
+          cat << 'EOF' > app/src/main/java/com/focuslock/app/MainActivity.kt
+          package com.focuslock.app
+
+          import android.app.*
+          import android.content.*
+          import android.content.pm.ServiceInfo
+          import android.graphics.Color
+          import android.graphics.Typeface
+          import android.net.Uri
+          import android.net.VpnService
+          import android.os.*
+          import android.provider.Settings
+          import android.system.OsConstants
+          import android.view.Gravity
+          import android.widget.*
+          import java.io.FileInputStream
+          import java.io.FileOutputStream
+          import java.net.DatagramPacket
+          import java.net.DatagramSocket
+          import java.net.InetAddress
+          import java.util.concurrent.Executors
+
+          // 1. ГЛАВНЫЙ ЭКРАН ПРИЛОЖЕНИЯ
+          class MainActivity : Activity() {
+
+              private lateinit var stateStore: LockStateStore
+              private lateinit var statusText: TextView
+              private lateinit var domainsInput: EditText
+              private lateinit var durationSpinner: Spinner
+              private lateinit var startButton: Button
+
+              private val uiHandler = Handler(Looper.getMainLooper())
+              private val durations = listOf(
+                  "30 минут" to 30L * 60 * 1000,
+                  "2 часа" to 2L * 60 * 60 * 1000,
+                  "24 часа (1 день)" to 24L * 60 * 60 * 1000,
+                  "7 дней (Неделя)" to 7L * 24 * 60 * 60 * 1000,
+                  "30 дней (Месяц)" to 30L * 24 * 60 * 60 * 1000,
+                  "365 дней (1 год)" to 365L * 24 * 60 * 60 * 1000
+              )
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  stateStore = LockStateStore(applicationContext)
+
+                  val scrollView = ScrollView(this).apply {
+                      setBackgroundColor(Color.parseColor("#121212"))
+                      isFillViewport = true
+                  }
+
+                  val rootLayout = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setPadding(48, 80, 48, 48)
+                      gravity = Gravity.CENTER_HORIZONTAL
+                  }
+
+                  val title = TextView(this).apply {
+                      text = "FOCUS LOCK: HARDCORE"
+                      textSize = 22f
+                      setTextColor(Color.WHITE)
+                      setTypeface(null, Typeface.BOLD)
+                      setPadding(0, 0, 0, 24)
+                  }
+
+                  statusText = TextView(this).apply {
+                      text = "Статус: Блокировка не активна"
+                      textSize = 16f
+                      setTextColor(Color.parseColor("#FF5252"))
+                      setPadding(24, 24, 24, 24)
+                      gravity = Gravity.CENTER
+                  }
+
+                  val domainsLabel = TextView(this).apply {
+                      text = "Сайты для блокировки (по одному в строке):"
+                      setTextColor(Color.LTGRAY)
+                      setPadding(0, 20, 0, 12)
+                  }
+
+                  domainsInput = EditText(this).apply {
+                      setText(stateStore.getBlockedDomains().joinToString("\n"))
+                      setTextColor(Color.WHITE)
+                      setBackgroundColor(Color.parseColor("#1E1E1E"))
+                      setPadding(24, 24, 24, 24)
+                      minLines = 5
+                  }
+
+                  val timerLabel = TextView(this).apply {
+                      text = "Таймер (отменить до истечения нельзя!):"
+                      setTextColor(Color.LTGRAY)
+                      setPadding(0, 36, 0, 12)
+                  }
+
+                  durationSpinner = Spinner(this).apply {
+                      adapter = ArrayAdapter(
+                          this@MainActivity,
+                          android.R.layout.simple_spinner_dropdown_item,
+                          durations.map { it.first }
+                      )
+                      setBackgroundColor(Color.parseColor("#E0E0E0"))
+                  }
+
+                  startButton = Button(this).apply {
+                      text = "ЗАПУСТИТЬ ЖЕСТКУЮ БЛОКИРОВКУ"
+                      setBackgroundColor(Color.parseColor("#D32F2F"))
+                      setTextColor(Color.WHITE)
+                      textSize = 15f
+                      setTypeface(null, Typeface.BOLD)
+                      setOnClickListener { onStartLockClicked() }
+                  }
+
+                  val buttonParams = LinearLayout.LayoutParams(
+                      LinearLayout.LayoutParams.MATCH_PARENT,
+                      LinearLayout.LayoutParams.WRAP_CONTENT
+                  ).apply { topMargin = 56 }
+
+                  rootLayout.addView(title)
+                  rootLayout.addView(statusText)
+                  rootLayout.addView(domainsLabel)
+                  rootLayout.addView(domainsInput)
+                  rootLayout.addView(timerLabel)
+                  rootLayout.addView(durationSpinner)
+                  rootLayout.addView(startButton, buttonParams)
+
+                  scrollView.addView(rootLayout)
+                  setContentView(scrollView)
+
+                  if (stateStore.isLockActive()) {
+                      startForegroundService(Intent(this, HardcoreBlockerVpnService::class.java))
+                  }
+                  startUiTicker()
+              }
+
+              private fun onStartLockClicked() {
+                  AlertDialog.Builder(this)
+                      .setTitle("Внимание: Отмены нет!")
+                      .setMessage(
+                          "Приложение создаст локальный VPN-фильтр для блокировки выбранных сайтов во всех браузерах.\n\n" +
+                          "Трафик фильтруется строго внутри устройства.\n\n" +
+                          "Кнопки «Отмена» НЕТ. Запускаем?"
+                      )
+                      .setPositiveButton("Да, заблокировать") { _, _ ->
+                          requestBatteryExemption()
+                          val vpnIntent = VpnService.prepare(this)
+                          if (vpnIntent != null) {
+                              startActivityForResult(vpnIntent, 100)
+                          } else {
+                              onActivityResult(100, RESULT_OK, null)
+                          }
+                      }
+                      .setNegativeButton("Назад", null)
+                      .show()
+              }
+
+              private fun requestBatteryExemption() {
+                  val pm = getSystemService(POWER_SERVICE) as PowerManager
+                  if (!pm.isIgnoringBatteryOptimizations(packageName)) {
+                      try {
+                          val intent = Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS).apply {
+                              data = Uri.parse("package:$packageName")
+                          }
+                          startActivity(intent)
+                      } catch (_: Exception) {}
+                  }
+              }
+
+              override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+                  super.onActivityResult(requestCode, resultCode, data)
+                  if (requestCode == 100 && resultCode == RESULT_OK) {
+                      val selectedDurationMs = durations[durationSpinner.selectedItemPosition].second
+                      val parsedDomains = domainsInput.text.toString()
+                          .split(",", "\n", " ")
+                          .map {
+                              it.trim().lowercase()
+                                  .removePrefix("https://")
+                                  .removePrefix("http://")
+                                  .removePrefix("www.")
+                                  .substringBefore("/")
+                          }
+                          .filter { it.contains(".") }
+                          .toSet()
+
+                      stateStore.startOrExtendLock(selectedDurationMs, parsedDomains)
+                      startForegroundService(Intent(this, HardcoreBlockerVpnService::class.java))
+                      updateUiState()
+                  }
+              }
+
+              private fun startUiTicker() {
+                  uiHandler.post(object : Runnable {
+                      override fun run() {
+                          updateUiState()
+                          uiHandler.postDelayed(this, 1000L)
+                      }
+                  })
+              }
+
+              private fun updateUiState() {
+                  if (stateStore.isLockActive()) {
+                      val rem = stateStore.getRemainingMillis()
+                      val totalSec = rem / 1000
+                      val d = totalSec / 86400
+                      val h = (totalSec % 86400) / 3600
+                      val m = (totalSec % 3600) / 60
+                      val s = totalSec % 60
+
+                      statusText.setTextColor(Color.parseColor("#00E676"))
+                      statusText.text = "БЛОКИРОВКА АКТИВНА!\nОсталось: ${d}д ${h}ч ${m}м ${s}с\nПопыток входа: ${stateStore.getBlockedCount()}"
+                      domainsInput.isEnabled = false
+                      startButton.text = "ПРОДЛИТЬ ТАЙМЕР (УМЕНЬШИТЬ НЕЛЬЗЯ)"
+                  } else {
+                      statusText.setTextColor(Color.parseColor("#FF5252"))
+                      statusText.text = "Статус: Блокировка не активна"
+                      domainsInput.isEnabled = true
+                      startButton.text = "ЗАПУСТИТЬ ЖЕСТКУЮ БЛОКИРОВКУ"
+                  }
+              }
+
+              override fun onDestroy() {
+                  uiHandler.removeCallbacksAndMessages(null)
+                  super.onDestroy()
+              }
+          }
+
+          // 2. ЗАЩИЩЕННОЕ ХРАНИЛИЩЕ ТАЙМЕРА (Защита от перевода часов)
+          class LockStateStore(context: Context) {
+              private val storageContext = context.createDeviceProtectedStorageContext()
+              private val prefs = storageContext.getSharedPreferences("hardcore_lock_prefs", Context.MODE_PRIVATE)
+
+              @Synchronized
+              fun startOrExtendLock(durationMillis: Long, domains: Set<String>) {
+                  syncElapsedTime()
+                  val currentRemaining = prefs.getLong("remaining_ms", 0L)
+                  val newRemaining = maxOf(currentRemaining, durationMillis)
+                  val merged = getBlockedDomains().toMutableSet().apply { addAll(domains) }
+
+                  prefs.edit()
+                      .putLong("remaining_ms", newRemaining)
+                      .putLong("last_elapsed", SystemClock.elapsedRealtime())
+                      .putStringSet("blocked_domains", merged)
+                      .commit()
+              }
+
+              @Synchronized
+              fun syncElapsedTime(): Long {
+                  val remaining = prefs.getLong("remaining_ms", 0L)
+                  if (remaining <= 0L) return 0L
+
+                  val now = SystemClock.elapsedRealtime()
+                  val last = prefs.getLong("last_elapsed", now)
+                  val delta = if (now >= last) (now - last) else now
+                  val updated = (remaining - delta).coerceAtLeast(0L)
+
+                  prefs.edit()
+                      .putLong("remaining_ms", updated)
+                      .putLong("last_elapsed", now)
+                      .commit()
+                  return updated
+              }
+
+              fun isLockActive(): Boolean = syncElapsedTime() > 0L
+              fun getRemainingMillis(): Long = syncElapsedTime()
+
+              fun getBlockedDomains(): Set<String> =
+                  prefs.getStringSet("blocked_domains", null) ?: setOf(
+                      "youtube.com", "tiktok.com", "instagram.com", "vk.com", "x.com"
+                  )
+
+              fun getBlockedCount(): Int = prefs.getInt("blocked_count", 0)
+
+              @Synchronized
+              fun incrementAndGetBlockedCount(): Int {
+                  val next = getBlockedCount() + 1
+                  prefs.edit().putInt("blocked_count", next).apply()
+                  return next
+              }
+          }
+
+          // 3. ЛОКАЛЬНЫЙ DNS VPN-СЕРВИС (Android 10+)
+          class HardcoreBlockerVpnService : VpnService() {
+
+              private var vpnInterface: ParcelFileDescriptor? = null
+              private var vpnThread: Thread? = null
+              private val dnsExecutor = Executors.newCachedThreadPool()
+              @Volatile private var isRunning = false
+
+              companion object {
+                  fun scheduleWatchdog(context: Context) {
+                      val am = context.getSystemService(Context.ALARM_SERVICE) as AlarmManager
+                      val intent = Intent(context, BootAndWatchdogReceiver::class.java).apply {
+                          action = "com.focuslock.app.ACTION_WATCHDOG_PULSE"
+                      }
+                      val pi = PendingIntent.getBroadcast(
+                          context, 777, intent,
+                          PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+                      )
+                      val triggerAt = SystemClock.elapsedRealtime() + 60_000L
+                      try {
+                          am.setExactAndAllowWhileIdle(AlarmManager.ELAPSED_REALTIME_WAKEUP, triggerAt, pi)
+                      } catch (_: Exception) {
+                          am.setAndAllowWhileIdle(AlarmManager.ELAPSED_REALTIME_WAKEUP, triggerAt, pi)
+                      }
+                  }
+              }
+
+              override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+                  val store = LockStateStore(applicationContext)
+                  if (!store.isLockActive()) {
+                      stopSelf()
+                      return START_NOT_STICKY
+                  }
+                  updateForegroundNotification(store.getRemainingMillis(), store.getBlockedCount())
+                  scheduleWatchdog(applicationContext)
+                  startVpnTunnelIfNeeded(store)
+                  return START_STICKY
+              }
+
+              private fun updateForegroundNotification(remainingMs: Long, blockedCount: Int) {
+                  val channelId = "focus_hardcore_channel"
+                  val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+                  val channel = NotificationChannel(channelId, "FocusLock Protection", NotificationManager.IMPORTANCE_LOW)
+                  nm.createNotificationChannel(channel)
+
+                  val totalMins = (remainingMs / 60000L).coerceAtLeast(0L)
+                  val hours = totalMins / 60
+                  val mins = totalMins % 60
+
+                  val notification = Notification.Builder(this, channelId)
+                      .setContentTitle("Жесткая блокировка активна")
+                      .setContentText("Осталось: ${hours}ч ${mins}м | Отбито попыток: $blockedCount")
+                      .setSmallIcon(android.R.drawable.ic_lock_lock)
+                      .setOngoing(true)
+                      .build()
+
+                  if (Build.VERSION.SDK_INT >= 34) {
+                      startForeground(1001, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_SYSTEM_EXEMPTED)
+                  } else {
+                      s
